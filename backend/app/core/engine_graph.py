@@ -92,38 +92,146 @@ def create_chat_event(
     }
 
 
-# ==================== END HELPER FUNCTIONS ====================
+def create_system_event(
+    game_state: 'GameState',
+    text: str,
+    event_type: str = "chat",
+    **extra_payload
+) -> Dict[str, Any]:
+    """Create a system announcement event."""
+    return create_chat_event(game_state, speaker="System", text=text, event_type=event_type, **extra_payload)
 
-async def get_player_action(player: Player, game_state: GameState):
-    """Wait for player action (LLM call)."""
-    # Context construction
-    # Context construction - Filter transcript for privacy
-    raw_transcript = game_state.transcript[-15:] # Fetch a bit more to filter down
-    filtered_transcript = []
+
+def get_filtered_transcript(
+    game_state: 'GameState',
+    player: Optional[Player] = None,
+    limit: int = 10,
+    public_only: bool = False,
+    phase_filter: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Get filtered transcript with privacy and phase filtering.
+    
+    Args:
+        game_state: The current game state
+        player: If provided, filter private messages based on player's role
+        limit: Maximum number of messages to return
+        public_only: If True, only return public messages
+        phase_filter: If provided, only return messages from this phase
+    """
+    raw_transcript = game_state.transcript[-(limit + 5):]  # Fetch extra to filter down
+    filtered = []
+    
     for t in raw_transcript:
         payload = t.get("payload", {})
         is_private = payload.get("private", False)
         
-        if not is_private:
-            filtered_transcript.append(t)
+        # Phase filter
+        if phase_filter and t.get("phase") != phase_filter:
             continue
-            
-        # Handle private messages
+        
+        # Public messages always included
+        if not is_private:
+            filtered.append(t)
+            continue
+        
+        # Public only mode - skip private
+        if public_only:
+            continue
+        
+        # No player context - skip private messages
+        if not player:
+            continue
+        
+        # Handle private messages based on player role
         speaker = payload.get("speaker", "")
         text = payload.get("text", "")
         
         # Mafia Chat - messages from [Mafia] tagged speakers
         if "[Mafia]" in speaker and player.role == Role.MAFIA:
-            filtered_transcript.append(t)
-        # Mafia-related System messages (votes, target selection) - for Mafia players only
+            filtered.append(t)
+        # Mafia-related System messages
         elif speaker == "System" and player.role == Role.MAFIA and ("🗳️" in text or "🎯" in text or "💤" in text):
-            filtered_transcript.append(t)
-        # Detective Investigation Result (System message with 🕵️ emoji)
+            filtered.append(t)
+        # Detective Investigation Result
         elif speaker == "System" and "🕵️" in text and player.role == Role.DETECTIVE:
-            filtered_transcript.append(t)
-            
-    recent_transcript = filtered_transcript[-10:] # Keep last 10 relevant
-    transcript_summary = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', t['type'])}" for t in recent_transcript])
+            filtered.append(t)
+    
+    return filtered[-limit:]
+
+
+def get_mafia_chats(game_state: 'GameState', limit: int = 15) -> List[Dict[str, Any]]:
+    """Get private mafia chat messages from recent transcript."""
+    return [
+        t for t in game_state.transcript[-limit:]
+        if t.get("payload", {}).get("private") and "[Mafia]" in t.get("payload", {}).get("speaker", "")
+    ]
+
+
+def tally_votes(votes: List[str], abstain_value: str = "abstain") -> Dict[str, int]:
+    """
+    Count votes excluding abstentions.
+    
+    Args:
+        votes: List of vote targets (player names or abstain)
+        abstain_value: Value to treat as abstention
+    
+    Returns:
+        Dictionary mapping target names to vote counts (excluding abstains)
+    """
+    tally: Dict[str, int] = {}
+    for vote in votes:
+        if vote.lower() == abstain_value.lower():
+            continue
+        if vote not in tally:
+            tally[vote] = 0
+        tally[vote] += 1
+    return tally
+
+
+def get_majority_winner(
+    tally: Dict[str, int],
+    total_voters: int
+) -> tuple[Optional[str], int, int]:
+    """
+    Determine if there's a majority winner.
+    
+    Args:
+        tally: Vote counts by candidate name
+        total_voters: Total number of voters (for calculating majority threshold)
+    
+    Returns:
+        Tuple of (winner_name or None, votes_received, votes_needed)
+    """
+    votes_needed = (total_voters + 1) // 2
+    
+    if not tally:
+        return None, 0, votes_needed
+    
+    most_voted = max(tally.items(), key=lambda x: x[1])
+    winner_name, most_votes = most_voted
+    
+    if most_votes >= votes_needed:
+        return winner_name, most_votes, votes_needed
+    
+    return None, most_votes, votes_needed
+
+
+def format_vote_summary(tally: Dict[str, int]) -> str:
+    """Format vote tally as a summary string."""
+    if not tally:
+        return "No votes cast"
+    sorted_votes = sorted(tally.items(), key=lambda x: x[1], reverse=True)
+    return ", ".join([f"{name}: {votes} vote(s)" for name, votes in sorted_votes])
+
+
+# ==================== END HELPER FUNCTIONS ====================
+
+async def get_player_action(player: Player, game_state: GameState) -> Dict[str, Any]:
+    """Wait for player action (LLM call)."""
+    # Get filtered transcript based on player's role (handles privacy)
+    recent_transcript = get_filtered_transcript(game_state, player=player, limit=10)
+    transcript_summary = build_transcript_summary(recent_transcript, limit=10)
     
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT + "\n" + get_role_prompt(player.role.value)},
@@ -146,66 +254,35 @@ Your Memory: {player.private_memory[-5:] if player.private_memory else "None"}
     return response
 
 async def handle_discussion(state: AgentState) -> AgentState:
+    """Handle day discussion phase - one player speaks per call."""
     game_state = state["game_state"]
     alive_players = [p for p in game_state.players if p.is_alive]
-    if not alive_players: return state
+    if not alive_players:
+        return state
 
-    # Morning Announcements are now handled in routes.py during phase transition
-
-    # Check the last message to see if any player was mentioned
-    # Mentioned players get priority to respond (they can respond, deflect, or ignore)
-    last_speaker_name = None
-    mentioned_players = []
+    # Get recent public chats for speaker selection
+    recent_chats = [
+        t for t in game_state.transcript[-5:]
+        if t.get("type") == "chat" and not t.get("payload", {}).get("private")
+    ]
     
-    # Look at the last few chat messages to find mentions
-    recent_chats = [t for t in game_state.transcript[-5:] 
-                    if t.get("type") == "chat" and not t.get("payload", {}).get("private")]
+    # Use helper to get last speaker and mentioned players
+    last_speaker, mentioned = get_last_speaker_and_mentions(recent_chats, alive_players)
     
-    if recent_chats:
-        last_chat = recent_chats[-1]
-        last_speaker_name = last_chat.get("payload", {}).get("speaker", "")
-        last_text = last_chat.get("payload", {}).get("text", "").lower()
-        
-        # Find all players mentioned in the last message (excluding the speaker themselves)
-        for player in alive_players:
-            if player.name != last_speaker_name:
-                # Check if player's name appears in the message
-                if player.name.lower() in last_text:
-                    mentioned_players.append(player)
-    
-    # Priority selection:
-    # 1. If someone was mentioned, they get 70% chance to respond
-    # 2. Otherwise, weighted random (players who spoke less recently have higher chance)
-    speaker = None
-    
-    if mentioned_players:
-        # Filter out the last speaker to avoid responding to themselves
-        eligible_mentioned = [p for p in mentioned_players if p.name != last_speaker_name]
-        if eligible_mentioned and random.random() < 0.7:
-            speaker = random.choice(eligible_mentioned)
-    
-    if not speaker:
-        # Avoid the same person speaking twice in a row
-        eligible = [p for p in alive_players if p.name != last_speaker_name]
-        if not eligible:
-            eligible = alive_players
-        speaker = random.choice(eligible)
+    # Use helper to select speaker with mention priority
+    speaker = select_speaker_with_mentions(
+        alive_players, mentioned, last_speaker, mention_response_chance=0.7
+    )
     
     response = await get_player_action(speaker, game_state)
     
     if response["public_text"]:
-        event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {"speaker": speaker.name, "text": response["public_text"]}
-        }
+        event = create_chat_event(game_state, speaker=speaker.name, text=response["public_text"])
         game_state.transcript.append(event)
         state["last_event"] = event
 
-    speaker.private_memory.append(response["private_thought"])
+    if response["private_thought"]:
+        speaker.private_memory.append(response["private_thought"])
     return state
 
 async def handle_voting(state: AgentState) -> AgentState:
@@ -219,41 +296,27 @@ async def handle_voting(state: AgentState) -> AgentState:
     if not alive_players or len(alive_players) < 2:
         return state
     
-    # If there's already an accused, skip (we're resuming from an innocent verdict)
-    if game_state.accused_id:
+    # Skip if already have an accused or voting is complete
+    if game_state.accused_id or game_state.voting_complete:
         return state
     
-    # If voting has already been completed this phase, skip
-    if game_state.voting_complete:
-        return state
-    
-    # Mark voting as started (will be fully complete after all votes)
     print(f"DEBUG: Starting voting phase - collecting votes from {len(alive_players)} players")
     
     # Announce voting has started
-    voting_start_event = {
-        "type": "chat",
-        "game_id": game_state.game_id,
-        "ts": int(time.time()),
-        "day": game_state.day,
-        "phase": game_state.phase.value,
-        "payload": {
-            "speaker": "System",
-            "text": f"🗳️ VOTING PHASE: Each player will now be asked individually who they want to put on trial. You may vote for a player or ABSTAIN based on the discussion."
-        }
-    }
-    game_state.transcript.append(voting_start_event)
+    start_event = create_system_event(
+        game_state,
+        "🗳️ VOTING PHASE: Each player will now be asked individually who they want to put on trial. You may vote for a player or ABSTAIN based on the discussion."
+    )
+    game_state.transcript.append(start_event)
     
-    # Collect votes from ALL players using structured voting
-    vote_tally = {}  # player_name -> vote count
-    votes_cast = []
+    # Build context from recent public discussion
+    public_transcript = get_filtered_transcript(game_state, public_only=True, limit=15)
+    discussion_context = build_transcript_summary(public_transcript, limit=15)
     
-    # Build context from recent discussion
-    discussion_context = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', '')}" 
-                                     for t in game_state.transcript[-15:] 
-                                     if t.get("type") == "chat" and not t.get("payload", {}).get("private")])
+    # Collect votes from all players
+    votes: List[str] = []  # Store raw vote targets
+    vote_tally: Dict[str, int] = {}  # player_name -> vote count
     
-    # Valid targets = all alive players except self, plus "abstain"
     for voter in alive_players:
         valid_targets = [p.name for p in alive_players if p.id != voter.id]
         valid_targets.append("abstain")
@@ -279,136 +342,68 @@ Or you may choose "ABSTAIN" if you are unsure or don't want to vote based on the
         
         print(f"DEBUG: Nomination vote from {voter.name}: {vote}")
         
-        # Process the vote
+        # Process and broadcast the vote
         if vote.lower() != "abstain":
-            # Find the target player
             target = next((p for p in game_state.players 
                           if p.name.lower() == vote.lower() and p.is_alive and p.id != voter.id), None)
             
             if target:
-                # Count the vote by player name
+                # Track vote
                 if target.name not in vote_tally:
                     vote_tally[target.name] = 0
                 vote_tally[target.name] += 1
-                votes_cast.append({"voter": voter.name, "target": target.name})
+                votes.append(target.name)
                 
-                # Broadcast the vote
-                vote_event = {
-                    "type": "chat",
-                    "game_id": game_state.game_id,
-                    "ts": int(time.time()),
-                    "day": game_state.day,
-                    "phase": game_state.phase.value,
-                    "payload": {
-                        "speaker": "System",
-                        "text": f"🗳️ {voter.name} votes to put {target.name} on trial!"
-                    }
-                }
-                game_state.transcript.append(vote_event)
+                # Broadcast
+                event = create_system_event(game_state, f"🗳️ {voter.name} votes to put {target.name} on trial!")
+                game_state.transcript.append(event)
             else:
-                # Could not find target - treat as skip
-                skip_event = {
-                    "type": "chat",
-                    "game_id": game_state.game_id,
-                    "ts": int(time.time()),
-                    "day": game_state.day,
-                    "phase": game_state.phase.value,
-                    "payload": {
-                        "speaker": "System",
-                        "text": f"⏭️ {voter.name} skips voting."
-                    }
-                }
-                game_state.transcript.append(skip_event)
+                # Invalid target - treat as skip
+                event = create_system_event(game_state, f"⏭️ {voter.name} skips voting.")
+                game_state.transcript.append(event)
         else:
-            # Abstain
-            skip_event = {
-                "type": "chat",
-                "game_id": game_state.game_id,
-                "ts": int(time.time()),
-                "day": game_state.day,
-                "phase": game_state.phase.value,
-                "payload": {
-                    "speaker": "System",
-                    "text": f"⏭️ {voter.name} skips voting."
-                }
-            }
-            game_state.transcript.append(skip_event)
+            event = create_system_event(game_state, f"⏭️ {voter.name} skips voting.")
+            game_state.transcript.append(event)
     
-    # Determine if anyone got enough votes (half of alive players, rounded up)
-    votes_needed = (len(alive_players) + 1) // 2  # Half, rounded up
-    most_voted_name = None
-    most_votes = 0
+    # Determine winner using helper
+    winner_name, most_votes, votes_needed = get_majority_winner(vote_tally, len(alive_players))
     
-    for player_name, votes in vote_tally.items():
-        if votes > most_votes:
-            most_votes = votes
-            most_voted_name = player_name
-    
-    # Announce vote results
-    vote_summary = []
-    for player_name, votes in sorted(vote_tally.items(), key=lambda x: x[1], reverse=True):
-        vote_summary.append(f"{player_name}: {votes} vote(s)")
-    
-    summary_text = ", ".join(vote_summary) if vote_summary else "No votes cast"
-    
-    results_event = {
-        "type": "chat",
-        "game_id": game_state.game_id,
-        "ts": int(time.time()),
-        "day": game_state.day,
-        "phase": game_state.phase.value,
-        "payload": {
-            "speaker": "System",
-            "text": f"📊 VOTE RESULTS: {summary_text}. Votes needed (half): {votes_needed}"
-        }
-    }
+    # Announce results
+    summary = format_vote_summary(vote_tally)
+    results_event = create_system_event(
+        game_state, 
+        f"📊 VOTE RESULTS: {summary}. Votes needed (half): {votes_needed}"
+    )
     game_state.transcript.append(results_event)
     
-    # Mark voting as complete
     game_state.voting_complete = True
     
-    # Check if someone got enough votes
-    if most_voted_name and most_votes >= votes_needed:
-        # Find the player by name
-        accused = next((p for p in game_state.players if p.name == most_voted_name and p.is_alive), None)
+    if winner_name:
+        accused = next((p for p in game_state.players if p.name == winner_name and p.is_alive), None)
         if accused:
             game_state.accused_id = accused.id
             game_state.last_phase_remaining_time = game_state.seconds_remaining
-            game_state.voting_complete = False  # Reset for next time we're in voting
+            game_state.voting_complete = False  # Reset for next time
             
-            # Announce they're being sent to the stand
-            trial_event = {
-                "type": "trial_started",
-                "game_id": game_state.game_id,
-                "ts": int(time.time()),
-                "day": game_state.day,
-                "phase": game_state.phase.value,
-                "payload": {
-                    "accused": accused.name,
-                    "votes": most_votes,
-                    "message": f"⚖️ {accused.name} has received {most_votes} votes and is being sent to the STAND! They will now plead their case."
-                }
-            }
+            trial_event = create_chat_event(
+                game_state,
+                speaker="System",
+                text=f"⚖️ {accused.name} has received {most_votes} votes and is being sent to the STAND! They will now plead their case.",
+                event_type="trial_started",
+                accused=accused.name,
+                votes=most_votes
+            )
             game_state.transcript.append(trial_event)
             state["last_event"] = trial_event
             
-            # Transition to Defense phase
             game_state.phase = Phase.DEFENSE
             game_state.seconds_remaining = game_state.config.phase_durations[Phase.DEFENSE]
             print(f"DEBUG: {accused.name} sent to trial with {most_votes} votes")
     else:
-        # No majority - announce and mark voting complete (will go to night when time is up)
-        no_trial_event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {
-                "speaker": "System",
-                "text": f"❌ No player received enough votes for trial. The town could not reach a consensus. Night will fall soon..."
-            }
-        }
+        no_trial_event = create_system_event(
+            game_state,
+            "❌ No player received enough votes for trial. The town could not reach a consensus. Night will fall soon..."
+        )
         game_state.transcript.append(no_trial_event)
     
     return state
@@ -652,32 +647,23 @@ async def handle_judgment(state: AgentState) -> AgentState:
         return state
     
     voters = [p for p in game_state.players if p.is_alive and p.id != game_state.accused_id]
-    
     if not voters:
         return state
     
     tally = {"guilty": 0, "innocent": 0, "abstain": 0}
-    votes_cast = []
     
     # Announce voting has begun
-    voting_start_event = {
-        "type": "chat",
-        "game_id": game_state.game_id,
-        "ts": int(time.time()),
-        "day": game_state.day,
-        "phase": game_state.phase.value,
-        "payload": {
-            "speaker": "System",
-            "text": f"⚖️ JUDGMENT TIME: The town will now vote on {accused.name}'s fate. Vote GUILTY, INNOCENT, or ABSTAIN."
-        }
-    }
-    game_state.transcript.append(voting_start_event)
+    start_event = create_system_event(
+        game_state,
+        f"⚖️ JUDGMENT TIME: The town will now vote on {accused.name}'s fate. Vote GUILTY, INNOCENT, or ABSTAIN."
+    )
+    game_state.transcript.append(start_event)
     
-    # Build context for voters
-    defense_context = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', '')}" 
-                                  for t in game_state.transcript[-10:] if t.get("phase") == "Defense"])
+    # Build context from defense phase
+    defense_transcript = get_filtered_transcript(game_state, phase_filter="Defense", limit=10)
+    defense_context = build_transcript_summary(defense_transcript, limit=10)
     
-    # Each voter casts their vote using structured voting
+    # Each voter casts their vote
     for voter in voters:
         context = f"""ACCUSED: {accused.name}
 
@@ -697,45 +683,29 @@ You must now decide: Is {accused.name} guilty of being Mafia?"""
         print(f"DEBUG: Judgment vote from {voter.name}: {vote}")
         
         tally[vote] += 1
-        votes_cast.append({"voter": voter.name, "vote": vote})
         
         # Announce the vote
         vote_emoji = {"guilty": "🔴", "innocent": "🟢", "abstain": "⚪"}.get(vote, "⚪")
-        vote_event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {
-                "speaker": "System",
-                "text": f"{vote_emoji} {voter.name} votes {vote.upper()}"
-            }
-        }
-        game_state.transcript.append(vote_event)
+        event = create_system_event(game_state, f"{vote_emoji} {voter.name} votes {vote.upper()}")
+        game_state.transcript.append(event)
     
     # Determine verdict
     verdict = "guilty" if tally["guilty"] > tally["innocent"] else "innocent"
     
     # Announce the verdict
-    verdict_event = {
-        "type": "trial_verdict",
-        "game_id": game_state.game_id,
-        "ts": int(time.time()),
-        "day": game_state.day,
-        "phase": game_state.phase.value,
-        "payload": {
-            "accused": accused.name,
-            "verdict": verdict,
-            "tally": tally,
-            "message": f"📜 VERDICT: {accused.name} has been found {verdict.upper()}! (Guilty: {tally['guilty']}, Innocent: {tally['innocent']}, Abstain: {tally['abstain']})"
-        }
-    }
+    verdict_event = create_chat_event(
+        game_state,
+        speaker="System",
+        text=f"📜 VERDICT: {accused.name} has been found {verdict.upper()}! (Guilty: {tally['guilty']}, Innocent: {tally['innocent']}, Abstain: {tally['abstain']})",
+        event_type="trial_verdict",
+        accused=accused.name,
+        verdict=verdict,
+        tally=tally
+    )
     game_state.transcript.append(verdict_event)
     state["last_event"] = verdict_event
     
     if verdict == "guilty":
-        # Move to Last Words phase
         game_state.phase = Phase.LAST_WORDS
         game_state.seconds_remaining = game_state.config.phase_durations[Phase.LAST_WORDS]
         print(f"DEBUG: {accused.name} found GUILTY - proceeding to Last Words")
@@ -743,67 +713,48 @@ You must now decide: Is {accused.name} guilty of being Mafia?"""
         # Innocent - return to Voting phase with remaining time
         game_state.phase = Phase.VOTING
         remaining_time = game_state.last_phase_remaining_time or 0
-        game_state.seconds_remaining = max(remaining_time - 10, 5)  # Subtract some time, minimum 5 seconds
+        game_state.seconds_remaining = max(remaining_time - 10, 5)
         game_state.accused_id = None
         
-        innocent_event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {
-                "speaker": "System",
-                "text": f"✅ {accused.name} has been found INNOCENT and returns to the town. Voting continues with {game_state.seconds_remaining} seconds remaining."
-            }
-        }
+        innocent_event = create_system_event(
+            game_state,
+            f"✅ {accused.name} has been found INNOCENT and returns to the town. Voting continues with {game_state.seconds_remaining} seconds remaining."
+        )
         game_state.transcript.append(innocent_event)
         print(f"DEBUG: {accused.name} found INNOCENT - returning to Voting")
     
     return state
 
 async def handle_last_words(state: AgentState) -> AgentState:
+    """Handle convicted player's last words before execution."""
     game_state = state["game_state"]
     accused = next((p for p in game_state.players if p.id == game_state.accused_id), None)
+    
     if accused:
         response = await get_player_action(accused, game_state)
         if response["public_text"]:
-            event = {
-                "type": "chat",
-                "game_id": game_state.game_id,
-                "ts": int(time.time()),
-                "day": game_state.day,
-                "phase": game_state.phase.value,
-                "payload": {"speaker": accused.name, "text": response["public_text"]}
-            }
+            event = create_chat_event(game_state, speaker=accused.name, text=response["public_text"])
             game_state.transcript.append(event)
             state["last_event"] = event
         
         # Execute
         accused.is_alive = False
-        execution_event = {
-            "type": "execution",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {"player": accused.name, "role_revealed": accused.role.value}
-        }
+        execution_event = create_chat_event(
+            game_state,
+            speaker="System",
+            text="",  # Not a chat event really
+            event_type="execution",
+            player=accused.name,
+            role_revealed=accused.role.value
+        )
         game_state.transcript.append(execution_event)
         
         # Announce death and reveal role publicly
-        death_announcement = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {
-                "speaker": "System",
-                "text": f"☠️ {accused.name} has been executed! They were a **{accused.role.value}**."
-            }
-        }
-        game_state.transcript.append(death_announcement)
+        death_event = create_system_event(
+            game_state,
+            f"☠️ {accused.name} has been executed! They were a **{accused.role.value}**."
+        )
+        game_state.transcript.append(death_event)
         
         # Update all players' memories with the revealed role
         for player in game_state.players:
@@ -823,67 +774,45 @@ async def handle_night(state: AgentState) -> AgentState:
     game_state = state["game_state"]
     
     mafia_members = [p for p in game_state.players if p.role == Role.MAFIA and p.is_alive]
-    
     if not mafia_members:
         return state
     
     # Get valid targets for context
     valid_targets = [p.name for p in game_state.players if p.is_alive and p.role != Role.MAFIA]
-    
     if not valid_targets:
         return state
     
-    # Get context from the day's events (public only)
-    day_context = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', t['type'])}" 
-                             for t in game_state.transcript[-15:] if not t.get("payload", {}).get("private")])
+    # Get context using helpers
+    public_transcript = get_filtered_transcript(game_state, public_only=True, limit=15)
+    day_context = build_transcript_summary(public_transcript, limit=15)
     
-    # Get mafia chat from this night (private messages between mafia)
-    mafia_chats = [t for t in game_state.transcript[-15:] 
-                   if t.get("payload", {}).get("private") and "[Mafia]" in t.get("payload", {}).get("speaker", "")]
+    mafia_chats = get_mafia_chats(game_state, limit=15)
+    mafia_chat = build_transcript_summary(mafia_chats, limit=15)
     
-    mafia_chat = "\n".join([f"{t['payload'].get('speaker', '')}: {t['payload'].get('text', '')}" 
-                            for t in mafia_chats])
-    
-    # RESPONSIVE speaker selection - similar to day discussion
+    # RESPONSIVE speaker selection
+    # Extract last speaker name (strip [Mafia] prefix)
     last_mafia_speaker = None
-    mentioned_mafia = []
+    mentioned_mafia: List[Player] = []
     
     if mafia_chats:
         last_chat = mafia_chats[-1]
-        last_mafia_speaker_full = last_chat.get("payload", {}).get("speaker", "")
-        # Extract name from "[Mafia] Player_X" format
-        last_mafia_speaker = last_mafia_speaker_full.replace("[Mafia] ", "")
+        last_speaker_full = last_chat.get("payload", {}).get("speaker", "")
+        last_mafia_speaker = last_speaker_full.replace("[Mafia] ", "")
         last_text = last_chat.get("payload", {}).get("text", "").lower()
         
-        # Find mafia members mentioned in the last message (for responsive replies)
-        for mafia in mafia_members:
-            if mafia.name != last_mafia_speaker and mafia.name.lower() in last_text:
-                mentioned_mafia.append(mafia)
+        # Find mafia members mentioned in the last message
+        mentioned_mafia = find_mentioned_players(last_text, mafia_members, exclude_names=[last_mafia_speaker])
     
-    # Choose speaker:
-    # 1. If someone was mentioned, they get 70% chance to respond
-    # 2. Otherwise, pick someone who hasn't spoken recently (avoiding repeat)
-    speaker = None
-    
-    if mentioned_mafia:
-        # Filter out the last speaker to avoid responding to themselves
-        eligible_mentioned = [m for m in mentioned_mafia if m.name != last_mafia_speaker]
-        if eligible_mentioned and random.random() < 0.7:
-            speaker = random.choice(eligible_mentioned)
-    
-    if not speaker:
-        # Avoid same person speaking twice in a row
-        eligible = [m for m in mafia_members if m.name != last_mafia_speaker]
-        if not eligible:
-            eligible = mafia_members
-        speaker = random.choice(eligible)
+    # Use helper for speaker selection
+    speaker = select_speaker_with_mentions(
+        mafia_members, mentioned_mafia, last_mafia_speaker, mention_response_chance=0.7
+    )
     
     # Build prompt based on whether this is initiating or responding
     teammates = [m.name for m in mafia_members if m.id != speaker.id]
     is_first_message = len(mafia_chats) == 0
     
     if is_first_message:
-        # Initiating the conversation
         prompt_context = f"""NIGHT {game_state.day} - MAFIA DISCUSSION (You are INITIATING)
 
 YOUR MAFIA TEAMMATES: {', '.join(teammates) if teammates else "(You are the only Mafia left)"}
@@ -898,7 +827,6 @@ ALIVE PLAYERS (potential targets): {', '.join(valid_targets)}
 You are starting the mafia discussion. Suggest a target and explain your reasoning.
 Consider who might be the Detective or who is dangerous to keep alive."""
     else:
-        # Responding to previous discussion
         prompt_context = f"""NIGHT {game_state.day} - MAFIA DISCUSSION (RESPONDING)
 
 YOUR MAFIA TEAMMATES: {', '.join(teammates) if teammates else "(You are the only Mafia left)"}
@@ -924,21 +852,18 @@ Keep the discussion moving toward a decision. If agreement is reached, strategiz
     response = await call_openrouter(discussion_messages, model=game_state.config.model)
     
     if response["public_text"]:
-        discussion_event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {"speaker": f"[Mafia] {speaker.name}", "text": response["public_text"], "private": True}
-        }
-        game_state.transcript.append(discussion_event)
+        event = create_chat_event(
+            game_state,
+            speaker=f"[Mafia] {speaker.name}",
+            text=response["public_text"],
+            private=True
+        )
+        game_state.transcript.append(event)
         print(f"DEBUG: Mafia discussion from {speaker.name}")
     
     if response["private_thought"]:
         speaker.private_memory.append(response["private_thought"])
     
-    # Voting and investigation happen at END of timer via routes.py
     return state
 
 
@@ -975,14 +900,12 @@ async def collect_day_votes(game_state: GameState) -> Optional[Player]:
     
     print(f"DEBUG: Collecting day votes from {len(alive_players)} players")
     
-    # Build context from recent discussion
-    discussion_context = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', '')}" 
-                                     for t in game_state.transcript[-15:] 
-                                     if t.get("type") == "chat" and not t.get("payload", {}).get("private")])
+    # Build context from recent public discussion
+    public_transcript = get_filtered_transcript(game_state, public_only=True, limit=15)
+    discussion_context = build_transcript_summary(public_transcript, limit=15)
     
-    vote_tally = {}  # player_name -> vote count
+    vote_tally: Dict[str, int] = {}
     
-    # Each player votes individually
     for voter in alive_players:
         valid_targets = [p.name for p in alive_players if p.id != voter.id]
         valid_targets.append("abstain")
@@ -1008,7 +931,7 @@ Or you may choose "ABSTAIN" if the conversation didn't reveal clear suspects."""
         
         print(f"DEBUG: {voter.name} votes: {vote}")
         
-        # Broadcast the vote
+        # Process and broadcast the vote
         if vote.lower() != "abstain":
             target = next((p for p in game_state.players 
                           if p.name.lower() == vote.lower() and p.is_alive and p.id != voter.id), None)
@@ -1018,83 +941,38 @@ Or you may choose "ABSTAIN" if the conversation didn't reveal clear suspects."""
                     vote_tally[target.name] = 0
                 vote_tally[target.name] += 1
                 
-                vote_event = {
-                    "type": "chat",
-                    "game_id": game_state.game_id,
-                    "ts": int(time.time()),
-                    "day": game_state.day,
-                    "phase": game_state.phase.value,
-                    "payload": {"speaker": "System", "text": f"🗳️ {voter.name} votes for {target.name}"}
-                }
-                game_state.transcript.append(vote_event)
+                event = create_system_event(game_state, f"🗳️ {voter.name} votes for {target.name}")
+                game_state.transcript.append(event)
             else:
-                # Invalid vote = abstain
-                abstain_event = {
-                    "type": "chat",
-                    "game_id": game_state.game_id,
-                    "ts": int(time.time()),
-                    "day": game_state.day,
-                    "phase": game_state.phase.value,
-                    "payload": {"speaker": "System", "text": f"⏭️ {voter.name} abstains"}
-                }
-                game_state.transcript.append(abstain_event)
+                event = create_system_event(game_state, f"⏭️ {voter.name} abstains")
+                game_state.transcript.append(event)
         else:
-            abstain_event = {
-                "type": "chat",
-                "game_id": game_state.game_id,
-                "ts": int(time.time()),
-                "day": game_state.day,
-                "phase": game_state.phase.value,
-                "payload": {"speaker": "System", "text": f"⏭️ {voter.name} abstains"}
-            }
-            game_state.transcript.append(abstain_event)
+            event = create_system_event(game_state, f"⏭️ {voter.name} abstains")
+            game_state.transcript.append(event)
     
-    # Determine if anyone got majority
-    votes_needed = (len(alive_players) + 1) // 2
-    most_voted_name = None
-    most_votes = 0
-    
-    for player_name, votes in vote_tally.items():
-        if votes > most_votes:
-            most_votes = votes
-            most_voted_name = player_name
+    # Determine winner using helper
+    winner_name, most_votes, votes_needed = get_majority_winner(vote_tally, len(alive_players))
     
     # Announce results
-    vote_summary = ", ".join([f"{name}: {votes}" for name, votes in sorted(vote_tally.items(), key=lambda x: -x[1])]) if vote_tally else "No votes"
-    
-    results_event = {
-        "type": "chat",
-        "game_id": game_state.game_id,
-        "ts": int(time.time()),
-        "day": game_state.day,
-        "phase": game_state.phase.value,
-        "payload": {"speaker": "System", "text": f"📊 RESULTS: {vote_summary}. Need {votes_needed} to nominate."}
-    }
+    summary = format_vote_summary(vote_tally)
+    results_event = create_system_event(
+        game_state,
+        f"📊 RESULTS: {summary}. Need {votes_needed} to nominate."
+    )
     game_state.transcript.append(results_event)
     
-    if most_voted_name and most_votes >= votes_needed:
-        accused = next((p for p in game_state.players if p.name == most_voted_name and p.is_alive), None)
+    if winner_name:
+        accused = next((p for p in game_state.players if p.name == winner_name and p.is_alive), None)
         if accused:
-            trial_event = {
-                "type": "chat",
-                "game_id": game_state.game_id,
-                "ts": int(time.time()),
-                "day": game_state.day,
-                "phase": game_state.phase.value,
-                "payload": {"speaker": "System", "text": f"⚖️ {accused.name} is PUT ON TRIAL with {most_votes} votes!"}
-            }
+            trial_event = create_system_event(
+                game_state,
+                f"⚖️ {accused.name} is PUT ON TRIAL with {most_votes} votes!"
+            )
             game_state.transcript.append(trial_event)
             print(f"DEBUG: {accused.name} nominated for trial with {most_votes} votes")
             return accused
     else:
-        no_trial_event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {"speaker": "System", "text": "❌ No majority reached. Night falls..."}
-        }
+        no_trial_event = create_system_event(game_state, "❌ No majority reached. Night falls...")
         game_state.transcript.append(no_trial_event)
     
     return None
@@ -1111,22 +989,18 @@ async def collect_mafia_votes(game_state: GameState) -> None:
     if not mafia_members:
         return
     
-    # Get valid targets
     valid_targets = [p.name for p in game_state.players if p.is_alive and p.role != Role.MAFIA]
-    
     if not valid_targets:
         return
     
     valid_targets.append("abstain")
     
-    # Build context from mafia discussion during night
-    mafia_chat = "\n".join([f"{t['payload'].get('speaker', '')}: {t['payload'].get('text', '')}" 
-                            for t in game_state.transcript[-15:] 
-                            if t.get("payload", {}).get("private") and "[Mafia]" in t.get("payload", {}).get("speaker", "")])
+    # Build context using helpers
+    mafia_chats = get_mafia_chats(game_state, limit=15)
+    mafia_chat = build_transcript_summary(mafia_chats, limit=15)
     
-    day_context = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', '')}" 
-                             for t in game_state.transcript[-20:] 
-                             if not t.get("payload", {}).get("private")])
+    public_transcript = get_filtered_transcript(game_state, public_only=True, limit=20)
+    day_context = build_transcript_summary(public_transcript, limit=20)
     
     context = f"""MAFIA DISCUSSION:
 {mafia_chat if mafia_chat else "(No discussion)"}
@@ -1139,7 +1013,7 @@ You may also "abstain" to not kill.
 
 WHO DO YOU VOTE TO KILL?"""
     
-    vote_tally = {}
+    vote_tally: Dict[str, int] = {}
     
     for mafia in mafia_members:
         vote = await call_structured_vote(
@@ -1156,49 +1030,43 @@ WHO DO YOU VOTE TO KILL?"""
             vote_tally[vote] = 0
         vote_tally[vote] += 1
         
-        vote_event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {"speaker": "System", "text": f"🗳️ {mafia.name} votes: {vote}", "private": True}
-        }
-        game_state.transcript.append(vote_event)
+        event = create_chat_event(
+            game_state,
+            speaker="System",
+            text=f"🗳️ {mafia.name} votes: {vote}",
+            private=True
+        )
+        game_state.transcript.append(event)
     
-    # Resolve votes
+    # Resolve votes (exclude abstains)
     player_votes = {k: v for k, v in vote_tally.items() if k.lower() != "abstain"}
     
     if player_votes:
         max_votes = max(player_votes.values())
         top_targets = [name for name, count in player_votes.items() if count == max_votes]
-        chosen_name = sorted(top_targets)[0]
+        chosen_name = sorted(top_targets)[0]  # Alphabetical tiebreaker
         
         target = next((p for p in game_state.players 
                       if p.name.lower() == chosen_name.lower() and p.is_alive and p.role != Role.MAFIA), None)
         
         if target:
             game_state.pending_kills = [target.id]
-            decision_event = {
-                "type": "chat",
-                "game_id": game_state.game_id,
-                "ts": int(time.time()),
-                "day": game_state.day,
-                "phase": game_state.phase.value,
-                "payload": {"speaker": "System", "text": f"🎯 Target: {target.name}", "private": True}
-            }
-            game_state.transcript.append(decision_event)
+            event = create_chat_event(
+                game_state,
+                speaker="System",
+                text=f"🎯 Target: {target.name}",
+                private=True
+            )
+            game_state.transcript.append(event)
             print(f"DEBUG: Mafia chose to kill {target.name}")
     else:
-        abstain_event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {"speaker": "System", "text": "💤 Mafia chose not to kill tonight.", "private": True}
-        }
-        game_state.transcript.append(abstain_event)
+        event = create_chat_event(
+            game_state,
+            speaker="System",
+            text="💤 Mafia chose not to kill tonight.",
+            private=True
+        )
+        game_state.transcript.append(event)
         print("DEBUG: Mafia abstained")
 
 
@@ -1238,14 +1106,12 @@ async def handle_detective_investigation(game_state: GameState) -> None:
         result = "MAFIA" if target.role == Role.MAFIA else "NOT MAFIA"
         detective.private_memory.append(f"Investigation: {target.name} is {result}")
         
-        event = {
-            "type": "chat",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {"speaker": "System", "text": f"🕵️ {target.name} is {result}", "private": True}
-        }
+        event = create_chat_event(
+            game_state,
+            speaker="System",
+            text=f"🕵️ {target.name} is {result}",
+            private=True
+        )
         game_state.transcript.append(event)
         print(f"DEBUG: Detective investigated {target.name}: {result}")
 
