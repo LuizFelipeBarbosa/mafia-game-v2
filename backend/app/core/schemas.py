@@ -46,7 +46,6 @@ class GameState(BaseModel):
     seconds_remaining: int = 45
     players: List[Player] = []
     transcript: List[Dict[str, Any]] = []
-    mafia_transcript: List[Dict[str, Any]] = []  # Private mafia night messages (not visible to town)
     is_paused: bool = True
     accused_id: Optional[str] = None
     last_phase_remaining_time: Optional[int] = None # For resuming voting phase

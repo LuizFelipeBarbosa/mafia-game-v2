@@ -23,13 +23,10 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
         # Send initial state snapshot
         game = get_game(game_id)
         if game:
-            # Exclude mafia_transcript - it's private to mafia only
-            payload = game.dict()
-            payload.pop("mafia_transcript", None)
             await websocket.send_json({
                 "type": "snapshot",
                 "game_id": game_id,
-                "payload": payload
+                "payload": game.dict()
             })
         
         while True:

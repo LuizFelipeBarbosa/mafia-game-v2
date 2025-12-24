@@ -15,28 +15,25 @@ class AgentState(TypedDict):
 async def get_player_action(player: Player, game_state: GameState):
     """Wait for player action (LLM call)."""
     # Context construction
-    # Context construction - Build transcript based on role
-    # Public transcript (seen by everyone)
-    raw_transcript = game_state.transcript[-15:]
+    # Context construction - Filter transcript for privacy
+    raw_transcript = game_state.transcript[-15:] # Fetch a bit more to filter down
     filtered_transcript = []
-    
     for t in raw_transcript:
         payload = t.get("payload", {})
         is_private = payload.get("private", False)
         
         if not is_private:
             filtered_transcript.append(t)
-        # Detective Result (System message aimed at Detective)
-        elif is_private and "Investigation Result" in payload.get("text", "") and player.role == Role.DETECTIVE:
+            continue
+            
+        # Handle private messages
+        speaker = payload.get("speaker", "")
+        # Mafia Chat
+        if "[Mafia]" in speaker and player.role == Role.MAFIA:
             filtered_transcript.append(t)
-    
-    # Mafia players also see their private mafia chat
-    if player.role == Role.MAFIA:
-        # Add recent mafia messages from mafia_transcript
-        recent_mafia = game_state.mafia_transcript[-10:]
-        filtered_transcript.extend(recent_mafia)
-        # Sort by timestamp if present
-        filtered_transcript.sort(key=lambda x: x.get("ts", 0))
+        # Detective Result (System message aimed at Detective)
+        elif "Investigation Result" in payload.get("text", "") and player.role == Role.DETECTIVE:
+            filtered_transcript.append(t)
             
     recent_transcript = filtered_transcript[-10:] # Keep last 10 relevant
     transcript_summary = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', t['type'])}" for t in recent_transcript])
@@ -544,15 +541,14 @@ Consider who might be the Detective or who is dangerous to keep alive."""}
     
     if response["public_text"]:
         discussion_event = {
-            "type": "mafia_chat",
+            "type": "chat",
             "game_id": game_state.game_id,
             "ts": int(time.time()),
             "day": game_state.day,
             "phase": game_state.phase.value,
             "payload": {"speaker": f"[Mafia] {speaker.name}", "text": response["public_text"], "private": True}
         }
-        # Store in mafia_transcript, NOT the main transcript (town can't see this)
-        game_state.mafia_transcript.append(discussion_event)
+        game_state.transcript.append(discussion_event)
         print(f"DEBUG: Mafia discussion from {speaker.name}")
     
     speaker.private_memory.append(response["private_thought"])
@@ -738,9 +734,10 @@ async def collect_mafia_votes(game_state: GameState) -> None:
     
     valid_targets.append("abstain")
     
-    # Build context from mafia discussion during night (from mafia_transcript)
+    # Build context from mafia discussion during night
     mafia_chat = "\n".join([f"{t['payload'].get('speaker', '')}: {t['payload'].get('text', '')}" 
-                            for t in game_state.mafia_transcript[-15:]])
+                            for t in game_state.transcript[-15:] 
+                            if t.get("payload", {}).get("private") and "[Mafia]" in t.get("payload", {}).get("speaker", "")])
     
     day_context = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', '')}" 
                              for t in game_state.transcript[-20:] 
@@ -775,15 +772,14 @@ WHO DO YOU VOTE TO KILL?"""
         vote_tally[vote] += 1
         
         vote_event = {
-            "type": "mafia_vote",
+            "type": "chat",
             "game_id": game_state.game_id,
             "ts": int(time.time()),
             "day": game_state.day,
             "phase": game_state.phase.value,
             "payload": {"speaker": "System", "text": f"🗳️ {mafia.name} votes: {vote}", "private": True}
         }
-        # Store in mafia_transcript (private to mafia only)
-        game_state.mafia_transcript.append(vote_event)
+        game_state.transcript.append(vote_event)
     
     # Resolve votes
     player_votes = {k: v for k, v in vote_tally.items() if k.lower() != "abstain"}
@@ -806,7 +802,7 @@ WHO DO YOU VOTE TO KILL?"""
                 "phase": game_state.phase.value,
                 "payload": {"speaker": "System", "text": f"🎯 Target: {target.name}", "private": True}
             }
-            # game_state.transcript.append(decision_event)
+            game_state.transcript.append(decision_event)
             print(f"DEBUG: Mafia chose to kill {target.name}")
     else:
         abstain_event = {
@@ -865,7 +861,7 @@ async def handle_detective_investigation(game_state: GameState) -> None:
             "phase": game_state.phase.value,
             "payload": {"speaker": "System", "text": f"🕵️ {target.name} is {result}", "private": True}
         }
-        #game_state.transcript.append(event)
+        game_state.transcript.append(event)
         print(f"DEBUG: Detective investigated {target.name}: {result}")
 
 def create_game_graph():

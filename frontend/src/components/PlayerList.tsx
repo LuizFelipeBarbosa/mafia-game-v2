@@ -11,14 +11,18 @@ interface PlayerListProps {
     players: Player[];
 }
 
+// Mafia roles have red names, Town roles have green names
+const MAFIA_ROLES = ['Mafia', 'Godfather', 'Mafioso', 'Consort', 'Consigliere', 'Janitor', 'Blackmailer', 'Framer'];
+
+const getNameColor = (role: string): string => {
+    if (MAFIA_ROLES.some(r => role.toLowerCase().includes(r.toLowerCase()))) {
+        return '#dc2626'; // Red for Mafia
+    }
+    return '#16a34a'; // Green for Town
+};
+
 const PlayerList: React.FC<PlayerListProps> = ({ players }) => {
     const aliveCount = players.filter(p => p.is_alive).length;
-
-    // Get color based on role
-    const getRoleColor = (role: string) => {
-        if (role === 'Mafia') return '#dc2626'; // Red for mafia
-        return '#16a34a'; // Green for town (Villager, Detective)
-    };
 
     return (
         <div style={{
@@ -34,7 +38,7 @@ const PlayerList: React.FC<PlayerListProps> = ({ players }) => {
             border: '1px solid #eee'
         }}>
             <h3 style={{ margin: '0 0 0.5rem 0', fontSize: '1.1rem', borderBottom: '1px solid #ddd', paddingBottom: '0.25rem' }}>
-                Players ({aliveCount}/{players.length} alive)
+                Players ({aliveCount} alive)
             </h3>
             <ul style={{ listStyle: 'none', padding: 0, margin: 0, maxHeight: '70vh', overflowY: 'auto' }}>
                 {players.map(player => (
@@ -48,15 +52,15 @@ const PlayerList: React.FC<PlayerListProps> = ({ players }) => {
                     }}>
                         <span style={{
                             fontWeight: 500,
-                            color: getRoleColor(player.role),
+                            color: getNameColor(player.role),
                             textDecoration: player.is_alive ? 'none' : 'line-through'
                         }}>
                             {player.name}
                         </span>
                         <span style={{
                             fontSize: '0.8rem',
-                            color: player.is_alive ? '#666' : '#999',
-                            backgroundColor: player.is_alive ? '#f0f0f0' : '#e5e5e5',
+                            color: '#666',
+                            backgroundColor: '#f0f0f0',
                             padding: '2px 6px',
                             borderRadius: '4px',
                             textDecoration: player.is_alive ? 'none' : 'line-through'

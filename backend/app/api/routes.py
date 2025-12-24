@@ -237,23 +237,24 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
     
     elif game.phase == Phase.NIGHT:
         # Night timer expired - NOW collect mafia votes
-        # This announcement is private to mafia only
         announce_event = {
-            "type": "mafia_chat",
+            "type": "chat",
             "game_id": game_id,
             "ts": int(time.time()),
             "day": game.day,
             "phase": game.phase.value,
             "payload": {"speaker": "System", "text": "⚰️ The Mafia now votes on their victim...", "private": True}
         }
-        # Store in mafia_transcript (NOT the main transcript - town cannot see this)
-        game.mafia_transcript.append(announce_event)
-        # Do NOT broadcast to all clients - mafia messages are private
+        game.transcript.append(announce_event)
+        await manager.broadcast(game_id, announce_event)
         
-        # Collect mafia votes (also writes to mafia_transcript)
+        # Collect mafia votes
+        old_len = len(game.transcript)
         await collect_mafia_votes(game)
         
-        # No broadcasting of mafia votes - they are private
+        # Broadcast mafia voting events
+        for event in game.transcript[old_len:]:
+            await manager.broadcast(game_id, event)
         
         # Detective investigation
         old_len = len(game.transcript)
@@ -369,10 +370,7 @@ async def step_game(game_id: str):
 async def get_game_status(game_id: str):
     game = get_game(game_id)
     if not game: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    # Exclude mafia_transcript from the response - it's private to mafia only
-    data = game.dict()
-    data.pop("mafia_transcript", None)
-    return data
+    return game
 
 @router.get("/games/{game_id}/export")
 async def export_game(game_id: str, debug: bool = False):
