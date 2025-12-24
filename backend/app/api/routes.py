@@ -8,7 +8,7 @@ from .ws import manager
 from ..core.schemas import GameState, GameConfig, Player, Role, Phase
 from ..core.storage import save_game, get_game, games
 from ..core.locks import get_game_lock
-from ..core.engine_graph import create_game_graph, AgentState, collect_day_votes, collect_mafia_votes, handle_detective_investigation, handle_judgment, handle_last_words
+from ..core.engine_graph import create_game_graph, AgentState, collect_day_votes, collect_mafia_votes, handle_detective_investigation, handle_judgment, handle_last_words, handle_discussion, handle_night, handle_defense
 
 router = APIRouter()
 graph = create_game_graph()
@@ -101,15 +101,16 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
 
     # === DURING PHASE (is_timer_tick=False): Just run discussion ===
     if not is_timer_tick:
-        phase_to_node = {
-            Phase.DISCUSSION: "discussion",
-            Phase.DEFENSE: "defense",
-            Phase.NIGHT: "night",
+        # Map phases to their handler functions
+        phase_handlers = {
+            Phase.DISCUSSION: handle_discussion,
+            Phase.DEFENSE: handle_defense,
+            Phase.NIGHT: handle_night,
         }
-        node = phase_to_node.get(game.phase)
-        if node:
+        handler = phase_handlers.get(game.phase)
+        if handler:
             state: AgentState = {"game_state": game, "last_event": None, "next_step": ""}
-            result = await graph.ainvoke(state)
+            result = await handler(state)  # Direct call to handler function
             game = result["game_state"]
             
             # Broadcast new events

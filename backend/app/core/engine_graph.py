@@ -28,11 +28,16 @@ async def get_player_action(player: Player, game_state: GameState):
             
         # Handle private messages
         speaker = payload.get("speaker", "")
-        # Mafia Chat
+        text = payload.get("text", "")
+        
+        # Mafia Chat - messages from [Mafia] tagged speakers
         if "[Mafia]" in speaker and player.role == Role.MAFIA:
             filtered_transcript.append(t)
-        # Detective Result (System message aimed at Detective)
-        elif "Investigation Result" in payload.get("text", "") and player.role == Role.DETECTIVE:
+        # Mafia-related System messages (votes, target selection) - for Mafia players only
+        elif speaker == "System" and player.role == Role.MAFIA and ("🗳️" in text or "🎯" in text or "💤" in text):
+            filtered_transcript.append(t)
+        # Detective Investigation Result (System message with 🕵️ emoji)
+        elif speaker == "System" and "🕵️" in text and player.role == Role.DETECTIVE:
             filtered_transcript.append(t)
             
     recent_transcript = filtered_transcript[-10:] # Keep last 10 relevant
@@ -517,16 +522,27 @@ async def handle_night(state: AgentState) -> AgentState:
     if not valid_targets:
         return state
     
-    # Get context from the day's events
+    # Get context from the day's events (public only)
     day_context = "\n".join([f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', t['type'])}" 
                              for t in game_state.transcript[-15:] if not t.get("payload", {}).get("private")])
+    
+    # Get mafia chat from this night (private messages between mafia)
+    mafia_chat = "\n".join([f"{t['payload'].get('speaker', '')}: {t['payload'].get('text', '')}" 
+                            for t in game_state.transcript[-15:] 
+                            if t.get("payload", {}).get("private") and "[Mafia]" in t.get("payload", {}).get("speaker", "")])
     
     # Pick ONE random mafia member to speak this step
     speaker = random.choice(mafia_members)
     
+    # Build the prompt with mafia chat context
+    mafia_chat_section = f"\n\nMAFIA CHAT:\n{mafia_chat}" if mafia_chat else ""
+    
     discussion_messages = [
         {"role": "system", "content": SYSTEM_PROMPT + "\n" + MAFIA_NIGHT_PROMPT},
         {"role": "user", "content": f"""NIGHT {game_state.day} - MAFIA DISCUSSION
+
+YOUR MAFIA TEAMMATES: {', '.join([m.name for m in mafia_members if m.id != speaker.id])}
+{mafia_chat_section}
 
 RECENT DAY EVENTS:
 {day_context if day_context else "(No significant events)"}
