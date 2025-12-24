@@ -85,10 +85,14 @@ const Game: React.FC = () => {
     }
 
     return (
-        <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
-            <PlayerList players={players} />
+        <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100%' }}>
             <PhaseHeader day={day} phase={phase} secondsRemaining={secondsRemaining} />
-            <Transcript events={events} />
+            <div style={{ display: 'flex', flex: 1, overflow: 'hidden', gap: '1rem', padding: '1rem' }}>
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                    <Transcript events={events} />
+                </div>
+                <PlayerList players={players} />
+            </div>
             <Controls gameId={id} isPaused={isPaused} onExport={handleExport} />
         </div>
     );

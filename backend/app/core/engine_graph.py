@@ -12,6 +12,88 @@ class AgentState(TypedDict):
     last_event: Optional[Dict[str, Any]]
     next_step: str # Hint for the next node if needed
 
+
+# ==================== HELPER FUNCTIONS ====================
+
+def find_mentioned_players(
+    text: str,
+    players: List[Player],
+    exclude_names: Optional[List[str]] = None
+) -> List[Player]:
+    """Find all players mentioned in text, excluding specified names."""
+    exclude = set(name.lower() for name in (exclude_names or []))
+    text_lower = text.lower()
+    return [
+        p for p in players
+        if p.name.lower() in text_lower and p.name.lower() not in exclude
+    ]
+
+
+def get_last_speaker_and_mentions(
+    chats: List[Dict[str, Any]],
+    players: List[Player]
+) -> tuple[Optional[str], List[Player]]:
+    """Extract last speaker name and mentioned players from recent chats."""
+    if not chats:
+        return None, []
+    
+    last_chat = chats[-1]
+    last_speaker = last_chat.get("payload", {}).get("speaker", "")
+    last_text = last_chat.get("payload", {}).get("text", "")
+    mentioned = find_mentioned_players(last_text, players, exclude_names=[last_speaker])
+    
+    return last_speaker, mentioned
+
+
+def build_transcript_summary(transcript: List[Dict[str, Any]], limit: int = 10) -> str:
+    """Build a formatted transcript summary string."""
+    return "\n".join([
+        f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', t['type'])}"
+        for t in transcript[-limit:]
+    ])
+
+
+def select_speaker_with_mentions(
+    players: List[Player],
+    mentioned: List[Player],
+    last_speaker: Optional[str],
+    mention_response_chance: float = 0.7
+) -> Player:
+    """Select a speaker, prioritizing mentioned players, avoiding repeat speakers."""
+    # Try mentioned players first
+    if mentioned:
+        eligible_mentioned = [p for p in mentioned if p.name != last_speaker]
+        if eligible_mentioned and random.random() < mention_response_chance:
+            return random.choice(eligible_mentioned)
+    
+    # Fall back to any eligible player
+    eligible = [p for p in players if p.name != last_speaker]
+    if not eligible:
+        eligible = players
+    
+    return random.choice(eligible)
+
+
+def create_chat_event(
+    game_state: 'GameState',
+    speaker: str,
+    text: str,
+    event_type: str = "chat",
+    **extra_payload
+) -> Dict[str, Any]:
+    """Create a standardized chat/event dictionary."""
+    return {
+        "type": event_type,
+        "game_id": game_state.game_id,
+        "ts": int(time.time()),
+        "day": game_state.day,
+        "phase": game_state.phase.value,
+        "payload": {"speaker": speaker, "text": text, **extra_payload}
+    }
+
+
+# ==================== END HELPER FUNCTIONS ====================
+
 async def get_player_action(player: Player, game_state: GameState):
     """Wait for player action (LLM call)."""
     # Context construction
@@ -70,9 +152,45 @@ async def handle_discussion(state: AgentState) -> AgentState:
 
     # Morning Announcements are now handled in routes.py during phase transition
 
-
-    # In Discussion, players take turns
-    speaker = random.choice([p for p in game_state.players if p.is_alive])
+    # Check the last message to see if any player was mentioned
+    # Mentioned players get priority to respond (they can respond, deflect, or ignore)
+    last_speaker_name = None
+    mentioned_players = []
+    
+    # Look at the last few chat messages to find mentions
+    recent_chats = [t for t in game_state.transcript[-5:] 
+                    if t.get("type") == "chat" and not t.get("payload", {}).get("private")]
+    
+    if recent_chats:
+        last_chat = recent_chats[-1]
+        last_speaker_name = last_chat.get("payload", {}).get("speaker", "")
+        last_text = last_chat.get("payload", {}).get("text", "").lower()
+        
+        # Find all players mentioned in the last message (excluding the speaker themselves)
+        for player in alive_players:
+            if player.name != last_speaker_name:
+                # Check if player's name appears in the message
+                if player.name.lower() in last_text:
+                    mentioned_players.append(player)
+    
+    # Priority selection:
+    # 1. If someone was mentioned, they get 70% chance to respond
+    # 2. Otherwise, weighted random (players who spoke less recently have higher chance)
+    speaker = None
+    
+    if mentioned_players:
+        # Filter out the last speaker to avoid responding to themselves
+        eligible_mentioned = [p for p in mentioned_players if p.name != last_speaker_name]
+        if eligible_mentioned and random.random() < 0.7:
+            speaker = random.choice(eligible_mentioned)
+    
+    if not speaker:
+        # Avoid the same person speaking twice in a row
+        eligible = [p for p in alive_players if p.name != last_speaker_name]
+        if not eligible:
+            eligible = alive_players
+        speaker = random.choice(eligible)
+    
     response = await get_player_action(speaker, game_state)
     
     if response["public_text"]:
@@ -297,54 +415,229 @@ Or you may choose "ABSTAIN" if you are unsure or don't want to vote based on the
 
 async def handle_defense(state: AgentState) -> AgentState:
     """
-    Defense Phase: The accused player makes their case to the town.
-    They get the full defense time to speak.
+    Defense Phase: Accused opens with a statement, then discussion follows.
+    Each call: One player speaks - accused first, then alternating discussion.
     """
     game_state = state["game_state"]
-    accused = next((p for p in game_state.players if p.id == game_state.accused_id), None)
+    accused = _get_accused(game_state)
     
-    if not accused:
-        # No accused, go back to voting
+    if not accused or not accused.is_alive:
         game_state.phase = Phase.VOTING
         return state
     
-    # The accused speaks in their defense
-    defense_prompt = f"""
-🔴 YOU ARE ON TRIAL! 🔴
-
-You have been nominated for execution by the town. You have {game_state.seconds_remaining} seconds to defend yourself.
-
-This is your chance to:
-- Explain your innocence
-- Point out inconsistencies in accusations against you
-- Cast suspicion on others who might be Mafia
-- Remind the town of helpful things you've done
-
-Your goal is to convince the town to vote INNOCENT. If they vote GUILTY, you will be executed.
-
-Make your case NOW!
-"""
+    alive_players = [p for p in game_state.players if p.is_alive]
+    other_players = [p for p in alive_players if p.id != accused.id]
     
-    response = await get_player_action(accused, game_state)
+    # Check if accused has already given opening statement
+    defense_chats = _get_defense_chats(game_state)
+    accused_has_opened = any(t.get("type") == "defense_speech" for t in defense_chats)
+    
+    # STEP 1: Accused MUST open with a defense statement
+    if not accused_has_opened:
+        return await _handle_opening_defense(state, accused, game_state)
+    
+    # STEP 2: Discussion - alternate between accused and challengers
+    speaker, is_accused_speaking = _select_defense_speaker(
+        accused, other_players, alive_players, defense_chats
+    )
+    
+    return await _handle_defense_discussion(
+        state, game_state, accused, speaker, is_accused_speaking
+    )
+
+
+def _get_accused(game_state: 'GameState') -> Optional[Player]:
+    """Get the currently accused player."""
+    return next(
+        (p for p in game_state.players if p.id == game_state.accused_id),
+        None
+    )
+
+
+def _get_defense_chats(game_state: 'GameState') -> List[Dict[str, Any]]:
+    """Get all chat messages from the Defense phase."""
+    return [
+        t for t in game_state.transcript
+        if t.get("phase") == "Defense" and t.get("type") in ("defense_speech", "chat")
+    ]
+
+
+def _select_defense_speaker(
+    accused: Player,
+    other_players: List[Player],
+    alive_players: List[Player],
+    defense_chats: List[Dict[str, Any]]
+) -> tuple[Player, bool]:
+    """
+    Select who speaks next in the defense phase.
+    Returns (speaker, is_accused_speaking).
+    """
+    last_speaker, mentioned_players = get_last_speaker_and_mentions(
+        defense_chats, alive_players
+    )
+    
+    # If accused was mentioned, they respond (70% chance)
+    if accused in mentioned_players and random.random() < 0.7:
+        return accused, True
+    
+    # Otherwise, a challenger speaks
+    if other_players:
+        # Prioritize mentioned players (excluding accused)
+        challenger_mentions = [p for p in mentioned_players if p.id != accused.id]
+        speaker = select_speaker_with_mentions(
+            other_players, challenger_mentions, last_speaker
+        )
+        return speaker, False
+    
+    # Fallback to accused
+    return accused, True
+
+
+async def _handle_opening_defense(
+    state: AgentState,
+    accused: Player,
+    game_state: 'GameState'
+) -> AgentState:
+    """Handle the accused's opening defense statement."""
+    transcript_summary = build_transcript_summary(game_state.transcript)
+    
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT + "\n" + get_role_prompt(accused.role.value) + _DEFENSE_OPENING_PROMPT
+        },
+        {
+            "role": "user",
+            "content": f"""Day {game_state.day} - YOU ARE ON TRIAL
+
+Recent Events:
+{transcript_summary}
+
+Your Role: {accused.role.value}
+Your Memory: {accused.private_memory[-5:] if accused.private_memory else "None"}
+
+⚠️ GIVE YOUR OPENING DEFENSE! Explain why you are innocent!"""
+        }
+    ]
+    
+    response = await call_openrouter(messages, model=game_state.config.model)
+    defense_text = response["public_text"] or "I am innocent! Please believe me!"
+    
+    event = create_chat_event(
+        game_state,
+        speaker=accused.name,
+        text=defense_text,
+        event_type="defense_speech",
+        is_defense=True
+    )
+    game_state.transcript.append(event)
+    state["last_event"] = event
+    
+    if response["private_thought"]:
+        accused.private_memory.append(response["private_thought"])
+    
+    return state
+
+
+async def _handle_defense_discussion(
+    state: AgentState,
+    game_state: 'GameState',
+    accused: Player,
+    speaker: Player,
+    is_accused_speaking: bool
+) -> AgentState:
+    """Handle discussion during defense phase (after opening statement)."""
+    transcript_summary = build_transcript_summary(game_state.transcript)
+    
+    if is_accused_speaking:
+        messages = _build_accused_response_messages(accused, game_state.day, transcript_summary)
+    else:
+        messages = _build_challenger_messages(speaker, accused, game_state.day, transcript_summary)
+    
+    response = await call_openrouter(messages, model=game_state.config.model)
     
     if response["public_text"]:
-        event = {
-            "type": "defense_speech",
-            "game_id": game_state.game_id,
-            "ts": int(time.time()),
-            "day": game_state.day,
-            "phase": game_state.phase.value,
-            "payload": {
-                "speaker": accused.name,
-                "text": response["public_text"],
-                "is_defense": True
-            }
-        }
+        event = create_chat_event(
+            game_state,
+            speaker=speaker.name,
+            text=response["public_text"],
+            event_type="defense_speech" if is_accused_speaking else "chat",
+            **(({"is_defense": True}) if is_accused_speaking else {})
+        )
         game_state.transcript.append(event)
         state["last_event"] = event
     
-    accused.private_memory.append(response["private_thought"])
+    if response["private_thought"]:
+        speaker.private_memory.append(response["private_thought"])
+    
     return state
+
+
+def _build_accused_response_messages(accused: Player, day: int, transcript: str) -> List[Dict]:
+    """Build LLM messages for accused responding to challenges."""
+    return [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT + "\n" + get_role_prompt(accused.role.value) + _DEFENSE_RESPONSE_PROMPT
+        },
+        {
+            "role": "user",
+            "content": f"""Day {day} - Defense Phase
+
+Recent Discussion:
+{transcript}
+
+Your Role: {accused.role.value}
+
+Respond to the challenges. Defend yourself!"""
+        }
+    ]
+
+
+def _build_challenger_messages(
+    speaker: Player,
+    accused: Player,
+    day: int,
+    transcript: str
+) -> List[Dict]:
+    """Build LLM messages for a player challenging the accused."""
+    return [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT + "\n" + get_role_prompt(speaker.role.value) + _CHALLENGER_PROMPT
+        },
+        {
+            "role": "user",
+            "content": f"""Day {day} - {accused.name} is on trial
+
+Recent Discussion:
+{transcript}
+
+Accused: {accused.name}
+Your Role: {speaker.role.value}
+
+Challenge their defense, ask questions, or share your opinion. Be brief!"""
+        }
+    ]
+
+
+# === Defense Phase Prompt Constants ===
+_DEFENSE_OPENING_PROMPT = """
+
+🔴 YOU ARE ON TRIAL FOR YOUR LIFE! 🔴
+
+You MUST defend yourself NOW. The town has voted to put you on trial.
+If you are found GUILTY, you will be EXECUTED immediately.
+Convince the town to vote INNOCENT. Your survival depends on this!
+"""
+
+_DEFENSE_RESPONSE_PROMPT = """
+🔴 YOU ARE ON TRIAL! Respond to challenges and defend yourself!
+"""
+
+_CHALLENGER_PROMPT = """
+⚖️ TRIAL IN PROGRESS - Challenge the accused's defense or express your opinion.
+"""
 
 async def handle_judgment(state: AgentState) -> AgentState:
     """
@@ -498,6 +791,24 @@ async def handle_last_words(state: AgentState) -> AgentState:
         }
         game_state.transcript.append(execution_event)
         
+        # Announce death and reveal role publicly
+        death_announcement = {
+            "type": "chat",
+            "game_id": game_state.game_id,
+            "ts": int(time.time()),
+            "day": game_state.day,
+            "phase": game_state.phase.value,
+            "payload": {
+                "speaker": "System",
+                "text": f"☠️ {accused.name} has been executed! They were a **{accused.role.value}**."
+            }
+        }
+        game_state.transcript.append(death_announcement)
+        
+        # Update all players' memories with the revealed role
+        for player in game_state.players:
+            player.private_memory.append(f"REVEALED: {accused.name} was {accused.role.value} (executed Day {game_state.day})")
+        
     game_state.accused_id = None
     game_state.phase = Phase.NIGHT
     game_state.seconds_remaining = game_state.config.phase_durations[Phase.NIGHT]
@@ -505,9 +816,9 @@ async def handle_last_words(state: AgentState) -> AgentState:
 
 async def handle_night(state: AgentState) -> AgentState:
     """
-    Night Phase Handler - DISCUSSION ONLY.
-    Mafia members discuss who to kill. Actual voting happens at end of timer
-    via collect_mafia_votes() called from routes.py.
+    Night Phase Handler - RESPONSIVE DISCUSSION.
+    Each call: ONE mafia member speaks. First initiates, others respond when mentioned.
+    Creates natural back-and-forth conversation. Actual voting happens at end of timer.
     """
     game_state = state["game_state"]
     
@@ -527,30 +838,87 @@ async def handle_night(state: AgentState) -> AgentState:
                              for t in game_state.transcript[-15:] if not t.get("payload", {}).get("private")])
     
     # Get mafia chat from this night (private messages between mafia)
+    mafia_chats = [t for t in game_state.transcript[-15:] 
+                   if t.get("payload", {}).get("private") and "[Mafia]" in t.get("payload", {}).get("speaker", "")]
+    
     mafia_chat = "\n".join([f"{t['payload'].get('speaker', '')}: {t['payload'].get('text', '')}" 
-                            for t in game_state.transcript[-15:] 
-                            if t.get("payload", {}).get("private") and "[Mafia]" in t.get("payload", {}).get("speaker", "")])
+                            for t in mafia_chats])
     
-    # Pick ONE random mafia member to speak this step
-    speaker = random.choice(mafia_members)
+    # RESPONSIVE speaker selection - similar to day discussion
+    last_mafia_speaker = None
+    mentioned_mafia = []
     
-    # Build the prompt with mafia chat context
-    mafia_chat_section = f"\n\nMAFIA CHAT:\n{mafia_chat}" if mafia_chat else ""
+    if mafia_chats:
+        last_chat = mafia_chats[-1]
+        last_mafia_speaker_full = last_chat.get("payload", {}).get("speaker", "")
+        # Extract name from "[Mafia] Player_X" format
+        last_mafia_speaker = last_mafia_speaker_full.replace("[Mafia] ", "")
+        last_text = last_chat.get("payload", {}).get("text", "").lower()
+        
+        # Find mafia members mentioned in the last message (for responsive replies)
+        for mafia in mafia_members:
+            if mafia.name != last_mafia_speaker and mafia.name.lower() in last_text:
+                mentioned_mafia.append(mafia)
     
-    discussion_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + "\n" + MAFIA_NIGHT_PROMPT},
-        {"role": "user", "content": f"""NIGHT {game_state.day} - MAFIA DISCUSSION
+    # Choose speaker:
+    # 1. If someone was mentioned, they get 70% chance to respond
+    # 2. Otherwise, pick someone who hasn't spoken recently (avoiding repeat)
+    speaker = None
+    
+    if mentioned_mafia:
+        # Filter out the last speaker to avoid responding to themselves
+        eligible_mentioned = [m for m in mentioned_mafia if m.name != last_mafia_speaker]
+        if eligible_mentioned and random.random() < 0.7:
+            speaker = random.choice(eligible_mentioned)
+    
+    if not speaker:
+        # Avoid same person speaking twice in a row
+        eligible = [m for m in mafia_members if m.name != last_mafia_speaker]
+        if not eligible:
+            eligible = mafia_members
+        speaker = random.choice(eligible)
+    
+    # Build prompt based on whether this is initiating or responding
+    teammates = [m.name for m in mafia_members if m.id != speaker.id]
+    is_first_message = len(mafia_chats) == 0
+    
+    if is_first_message:
+        # Initiating the conversation
+        prompt_context = f"""NIGHT {game_state.day} - MAFIA DISCUSSION (You are INITIATING)
 
-YOUR MAFIA TEAMMATES: {', '.join([m.name for m in mafia_members if m.id != speaker.id])}
-{mafia_chat_section}
+YOUR MAFIA TEAMMATES: {', '.join(teammates) if teammates else "(You are the only Mafia left)"}
+
+YOU ARE {speaker.name}.
 
 RECENT DAY EVENTS:
 {day_context if day_context else "(No significant events)"}
 
 ALIVE PLAYERS (potential targets): {', '.join(valid_targets)}
 
-Discuss with your fellow Mafia: Who should we kill tonight and why?
-Consider who might be the Detective or who is dangerous to keep alive."""}
+You are starting the mafia discussion. Suggest a target and explain your reasoning.
+Consider who might be the Detective or who is dangerous to keep alive."""
+    else:
+        # Responding to previous discussion
+        prompt_context = f"""NIGHT {game_state.day} - MAFIA DISCUSSION (RESPONDING)
+
+YOUR MAFIA TEAMMATES: {', '.join(teammates) if teammates else "(You are the only Mafia left)"}
+
+YOU ARE {speaker.name}.
+
+MAFIA CHAT SO FAR:
+{mafia_chat}
+
+RECENT DAY EVENTS:
+{day_context if day_context else "(No significant events)"}
+
+ALIVE PLAYERS (potential targets): {', '.join(valid_targets)}
+
+Respond to your teammates' suggestions. Agree, disagree, or propose a different target.
+Keep the discussion moving toward a decision. If agreement is reached, strategize for future nights."""
+    
+    discussion_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT + "\n" + MAFIA_NIGHT_PROMPT},
+        {"role": "user", "content": prompt_context}
     ]
     
     response = await call_openrouter(discussion_messages, model=game_state.config.model)
@@ -567,7 +935,8 @@ Consider who might be the Detective or who is dangerous to keep alive."""}
         game_state.transcript.append(discussion_event)
         print(f"DEBUG: Mafia discussion from {speaker.name}")
     
-    speaker.private_memory.append(response["private_thought"])
+    if response["private_thought"]:
+        speaker.private_memory.append(response["private_thought"])
     
     # Voting and investigation happen at END of timer via routes.py
     return state

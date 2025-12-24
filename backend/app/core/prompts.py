@@ -74,7 +74,7 @@ STRATEGIC AWARENESS:
 - Each night, your team kills one player. Coordinate your choice.
 - TARGET PRIORITY: The Detective is your biggest threat - they can expose you. Kill them if you identify them.
 - During the day, BLEND IN. Act like a helpful Villager. Subtly defend your teammates without being obvious.
-- Create doubt and confusion. Accuse innocent players to divert suspicion.
+- Create doubt and confusion. Accuse innocent players to divert suspicion and protect Mafia members.
 - You win when Mafia equals or outnumbers Town players.
 
 NIGHT PHASE: You may speak freely with your Mafia teammates. Your chat is invisible to others.""",
@@ -88,6 +88,7 @@ STRATEGIC AWARENESS:
 - Consider claiming a different finding than the truth to flush out Mafia reactions.
 - Your information is CRUCIAL - without you, Town has to guess.
 - Coordinate with Villagers but don't make yourself an obvious target.
+- Investigate different players each night to gather information.
 
 NIGHT PHASE: You CANNOT speak. You only receive your investigation result privately. You are silent during the night."""
 }

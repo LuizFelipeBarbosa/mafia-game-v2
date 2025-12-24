@@ -26,16 +26,14 @@ const PlayerList: React.FC<PlayerListProps> = ({ players }) => {
 
     return (
         <div style={{
-            position: 'absolute',
-            top: '1rem',
-            right: '1rem',
             backgroundColor: 'rgba(255, 255, 255, 0.95)',
             padding: '1rem',
             borderRadius: '8px',
             boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
-            zIndex: 1000,
-            maxWidth: '250px',
-            border: '1px solid #eee'
+            width: '250px',
+            flexShrink: 0,
+            border: '1px solid #eee',
+            overflowY: 'auto'
         }}>
             <h3 style={{ margin: '0 0 0.5rem 0', fontSize: '1.1rem', borderBottom: '1px solid #ddd', paddingBottom: '0.25rem' }}>
                 Players ({aliveCount} alive)

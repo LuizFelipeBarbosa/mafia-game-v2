@@ -68,6 +68,19 @@ const Transcript: React.FC<TranscriptProps> = ({ events }) => {
                         <p>{event.payload.reason}</p>
                     </div>
                 );
+            case 'defense_speech':
+                return (
+                    <div key={index} style={{
+                        marginBottom: '0.5rem',
+                        backgroundColor: '#fff3cd',
+                        border: '1px solid #ffc107',
+                        borderRadius: '8px',
+                        padding: '0.75rem',
+                        margin: '0.5rem 0'
+                    }}>
+                        <strong style={{ color: '#856404' }}>⚖️ {event.payload.speaker} (DEFENSE):</strong> {event.payload.text}
+                    </div>
+                );
             default:
                 return null;
         }

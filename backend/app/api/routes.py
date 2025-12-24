@@ -122,6 +122,7 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
         return
 
     # === TIMER EXPIRED (is_timer_tick=True): Trigger end-of-round voting ===
+    phase_start_sent = False  # Track if we've already sent phase_start
     
     if game.phase == Phase.DISCUSSION:
         if game.day == 1:
@@ -156,6 +157,40 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
                 game.accused_id = accused.id
                 game.phase = Phase.DEFENSE
                 game.seconds_remaining = game.config.phase_durations[Phase.DEFENSE]
+                
+                # Announce trial start
+                trial_announce = {
+                    "type": "chat",
+                    "game_id": game_id,
+                    "ts": int(time.time()),
+                    "day": game.day,
+                    "phase": game.phase.value,
+                    "payload": {"speaker": "System", "text": f"⚖️ {accused.name} is now on trial! They must defend themselves!"}
+                }
+                game.transcript.append(trial_announce)
+                await manager.broadcast(game_id, trial_announce)
+                
+                # Broadcast phase_start BEFORE defense speeches so it appears first in chat
+                phase_start_event = {
+                    "type": "phase_start",
+                    "game_id": game_id,
+                    "day": game.day,
+                    "phase": game.phase.value,
+                    "payload": {"duration_sec": game.seconds_remaining}
+                }
+                game.transcript.append(phase_start_event)
+                await manager.broadcast(game_id, phase_start_event)
+                phase_start_sent = True  # Mark that we've already sent phase_start
+                
+                # IMMEDIATELY run defense - accused MUST speak first
+                state: AgentState = {"game_state": game, "last_event": None, "next_step": ""}
+                old_len = len(game.transcript)
+                result = await handle_defense(state)
+                game = result["game_state"]
+                
+                # Broadcast the defense speech
+                for event in game.transcript[old_len:]:
+                    await manager.broadcast(game_id, event)
             else:
                 # No nomination - go to night
                 game.phase = Phase.NIGHT
@@ -287,20 +322,40 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
                     }
                     game.transcript.append(event)
                     await manager.broadcast(game_id, event)
+                    
+                    # Announce death and reveal role publicly
+                    death_announcement = {
+                        "type": "chat",
+                        "game_id": game_id,
+                        "ts": int(time.time()),
+                        "day": game.day,
+                        "phase": game.phase.value,
+                        "payload": {
+                            "speaker": "System",
+                            "text": f"☠️ {killed_player.name} was found dead! They were a **{killed_player.role.value}**."
+                        }
+                    }
+                    game.transcript.append(death_announcement)
+                    await manager.broadcast(game_id, death_announcement)
+                    
+                    # Update all players' memories with the revealed role
+                    for player in game.players:
+                        player.private_memory.append(f"REVEALED: {killed_player.name} was {killed_player.role.value} (killed Night {game.day - 1})")
             game.pending_kills = []
         
         # Check win condition after night kills
         if await check_win_condition(game, game_id):
             return
     
-    # Broadcast phase start if we transitioned
-    await manager.broadcast(game_id, {
-        "type": "phase_start",
-        "game_id": game_id,
-        "day": game.day,
-        "phase": game.phase.value,
-        "payload": {"duration_sec": game.seconds_remaining}
-    })
+    # Broadcast phase start if we transitioned (and haven't already sent one)
+    if not phase_start_sent:
+        await manager.broadcast(game_id, {
+            "type": "phase_start",
+            "game_id": game_id,
+            "day": game.day,
+            "phase": game.phase.value,
+            "payload": {"duration_sec": game.seconds_remaining}
+        })
 
     save_game(game_id, game)
 
