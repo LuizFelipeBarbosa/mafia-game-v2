@@ -7,6 +7,8 @@ const Home: React.FC = () => {
     const [numPlayers, setNumPlayers] = useState(5);
     const [numMafia, setNumMafia] = useState(1);
     const [hasDetective, setHasDetective] = useState(true);
+    const [hasDoctor, setHasDoctor] = useState(true);
+    const [hasVigilante, setHasVigilante] = useState(true);
     const [model, setModel] = useState("openai/gpt-3.5-turbo");
 
     const handleCreate = async (e: React.FormEvent) => {
@@ -15,6 +17,8 @@ const Home: React.FC = () => {
             num_players: numPlayers,
             num_mafia: numMafia,
             has_detective: hasDetective,
+            has_doctor: hasDoctor,
+            has_vigilante: hasVigilante,
             model: model,
             phase_durations: {
                 "Discussion": 45,
@@ -44,6 +48,14 @@ const Home: React.FC = () => {
                 <label>
                     Include Detective:
                     <input type="checkbox" checked={hasDetective} onChange={e => setHasDetective(e.target.checked)} />
+                </label>
+                <label>
+                    Include Doctor:
+                    <input type="checkbox" checked={hasDoctor} onChange={e => setHasDoctor(e.target.checked)} />
+                </label>
+                <label>
+                    Include Vigilante:
+                    <input type="checkbox" checked={hasVigilante} onChange={e => setHasVigilante(e.target.checked)} />
                 </label>
                 <label>
                     Model (OpenRouter):

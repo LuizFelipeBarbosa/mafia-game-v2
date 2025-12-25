@@ -8,7 +8,7 @@ from .ws import manager
 from ..core.schemas import GameState, GameConfig, Player, Role, Phase
 from ..core.storage import save_game, get_game, games
 from ..core.locks import get_game_lock
-from ..core.engine_graph import create_game_graph, AgentState, collect_day_votes, collect_mafia_votes, handle_detective_investigation, handle_judgment, handle_last_words, handle_discussion, handle_night, handle_defense
+from ..core.engine_graph import create_game_graph, AgentState, collect_day_votes, collect_mafia_votes, handle_detective_investigation, collect_doctor_vote, handle_judgment, handle_last_words, handle_discussion, handle_night, handle_defense, collect_vigilante_vote, process_vigilante_kill, process_doom_death
 
 router = APIRouter()
 graph = create_game_graph()
@@ -125,6 +125,9 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
     phase_start_sent = False  # Track if we've already sent phase_start
     
     if game.phase == Phase.DISCUSSION:
+        # Increment discussion count when a discussion phase timer expires
+        game.discussion_count += 1
+        
         if game.day == 1:
             # Day 1: No voting, go straight to night
             game.phase = Phase.NIGHT
@@ -292,6 +295,18 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
         for event in game.transcript[old_len:]:
             await manager.broadcast(game_id, event)
         
+        # Vigilante action (if alive and has bullet)
+        old_len = len(game.transcript)
+        await collect_vigilante_vote(game)
+        for event in game.transcript[old_len:]:
+            await manager.broadcast(game_id, event)
+        
+        # Doctor protection choice
+        old_len = len(game.transcript)
+        await collect_doctor_vote(game)
+        for event in game.transcript[old_len:]:
+            await manager.broadcast(game_id, event)
+        
         # Detective investigation
         old_len = len(game.transcript)
         await handle_detective_investigation(game)
@@ -305,10 +320,99 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
         game.voting_complete = False
         game.mafia_votes_collected = False
         game.mafia_discussion_done = False
+        game.discussion_count = 0  # Reset discussion count for new day
         
-        # Process morning announcements (kills)
+        # Process doom death first (vigilante who misfired dies from guilt)
+        doomed_player = process_doom_death(game)
+        if doomed_player:
+            event = {
+                "type": "night_result",
+                "game_id": game_id,
+                "ts": int(time.time()),
+                "day": game.day,
+                "phase": game.phase.value,
+                "payload": {"killed": doomed_player.name, "role_revealed": doomed_player.role.value, "cause": "guilt"}
+            }
+            game.transcript.append(event)
+            await manager.broadcast(game_id, event)
+            
+            # Doom death announcement
+            doom_announcement = {
+                "type": "chat",
+                "game_id": game_id,
+                "ts": int(time.time()),
+                "day": game.day,
+                "phase": game.phase.value,
+                "payload": {
+                    "speaker": "System",
+                    "text": f"💀 {doomed_player.name} died from guilt after killing a town member. They were the **Vigilante**."
+                }
+            }
+            game.transcript.append(doom_announcement)
+            await manager.broadcast(game_id, doom_announcement)
+            
+            # Update all players' memories
+            for player in game.players:
+                player.private_memory.append(f"REVEALED: {doomed_player.name} was Vigilante (died from guilt Night {game.day - 1})")
+        
+        # Process vigilante kill
+        vigilante_victim = process_vigilante_kill(game)
+        if vigilante_victim:
+            event = {
+                "type": "night_result",
+                "game_id": game_id,
+                "ts": int(time.time()),
+                "day": game.day,
+                "phase": game.phase.value,
+                "payload": {"killed": vigilante_victim.name, "role_revealed": vigilante_victim.role.value, "cause": "vigilante"}
+            }
+            game.transcript.append(event)
+            await manager.broadcast(game_id, event)
+            
+            # Vigilante kill announcement
+            vigilante_announcement = {
+                "type": "chat",
+                "game_id": game_id,
+                "ts": int(time.time()),
+                "day": game.day,
+                "phase": game.phase.value,
+                "payload": {
+                    "speaker": "System",
+                    "text": f"🔫 {vigilante_victim.name} was shot by the Vigilante! They were a **{vigilante_victim.role.value}**."
+                }
+            }
+            game.transcript.append(vigilante_announcement)
+            await manager.broadcast(game_id, vigilante_announcement)
+            
+            # Update all players' memories
+            for player in game.players:
+                player.private_memory.append(f"REVEALED: {vigilante_victim.name} was {vigilante_victim.role.value} (shot by Vigilante Night {game.day - 1})")
+        
+        # Process morning announcements (mafia kills)
         if game.pending_kills:
             for killed_id in game.pending_kills:
+                # Check if target is protected by Doctor
+                if killed_id == game.doctor_protected_id:
+                    # Attack prevented by Doctor!
+                    saved_player = next((p for p in game.players if p.id == killed_id), None)
+                    if saved_player:
+                        saved_announcement = {
+                            "type": "chat",
+                            "game_id": game_id,
+                            "ts": int(time.time()),
+                            "day": game.day,
+                            "phase": game.phase.value,
+                            "payload": {
+                                "speaker": "System",
+                                "text": f"🏥 Someone was attacked last night, but they survived!",
+                                "private": True
+                            }
+                        }
+                        game.transcript.append(saved_announcement)
+                        await manager.broadcast(game_id, saved_announcement)
+                        print(f"DEBUG: Doctor saved {saved_player.name} from Mafia kill!")
+                    continue  # Skip this kill, target is protected
+                
                 killed_player = next((p for p in game.players if p.id == killed_id), None)
                 if killed_player:
                     killed_player.is_alive = False
@@ -343,6 +447,9 @@ async def advance_game(game_id: str, is_timer_tick: bool = False):
                         player.private_memory.append(f"REVEALED: {killed_player.name} was {killed_player.role.value} (killed Night {game.day - 1})")
             game.pending_kills = []
         
+        # Clear doctor protection at end of night
+        game.doctor_protected_id = None
+        
         # Check win condition after night kills
         if await check_win_condition(game, game_id):
             return
@@ -367,6 +474,10 @@ async def create_new_game(config: GameConfig):
     roles = [Role.MAFIA] * config.num_mafia
     if config.has_detective:
         roles.append(Role.DETECTIVE)
+    if config.has_doctor:
+        roles.append(Role.DOCTOR)
+    if config.has_vigilante:
+        roles.append(Role.VIGILANTE)
     roles += [Role.VILLAGER] * (config.num_players - len(roles))
     random.shuffle(roles)
     

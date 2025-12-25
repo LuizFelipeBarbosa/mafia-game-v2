@@ -15,11 +15,15 @@ class Role(str, Enum):
     VILLAGER = "Villager"
     MAFIA = "Mafia"
     DETECTIVE = "Detective"
+    DOCTOR = "Doctor"
+    VIGILANTE = "Vigilante"
 
 class GameConfig(BaseModel):
     num_players: int = 5
     num_mafia: int = 1
     has_detective: bool = True
+    has_doctor: bool = False
+    has_vigilante: bool = False
     phase_durations: Dict[Phase, int] = {
         Phase.DISCUSSION: 45,
         Phase.VOTING: 30,
@@ -54,3 +58,10 @@ class GameState(BaseModel):
     voting_complete: bool = False  # Track if voting has been done for this phase
     mafia_votes_collected: bool = False  # Track if mafia structured voting is done for this night
     mafia_discussion_done: bool = False  # Track if mafia discussion is done for this night
+    # Vigilante tracking
+    vigilante_shot_used: bool = False  # Once true, vigilante cannot shoot again
+    doomed_player_id: Optional[str] = None  # Vigilante who misfired (dies next night)
+    vigilante_pending_kill: Optional[str] = None  # Target ID for vigilante's shot this night
+    discussion_count: int = 0  # Track number of discussion phases per day (max 2)
+    # Doctor tracking
+    doctor_protected_id: Optional[str] = None  # Player ID protected by Doctor this night

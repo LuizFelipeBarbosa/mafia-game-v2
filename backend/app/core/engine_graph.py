@@ -573,18 +573,19 @@ def _build_accused_response_messages(accused: Player, day: int, transcript: str)
     return [
         {
             "role": "system",
-            "content": SYSTEM_PROMPT + "\n" + get_role_prompt(accused.role.value) + _DEFENSE_RESPONSE_PROMPT
+            "content": SYSTEM_PROMPT + "\n" + get_role_prompt(accused.role.value) + _DEFENSE_OPENING_PROMPT
         },
         {
             "role": "user",
-            "content": f"""Day {day} - Defense Phase
+            "content": f"""Day {day} - YOU ARE ON TRIAL
 
-Recent Discussion:
+Recent Events:
 {transcript}
 
 Your Role: {accused.role.value}
+Your Memory: {accused.private_memory[-5:] if accused.private_memory else "None"}
 
-Respond to the challenges. Defend yourself!"""
+⚠️ GIVE YOUR DEFENSE! Explain why you are innocent!"""
         }
     ]
 
@@ -624,10 +625,6 @@ _DEFENSE_OPENING_PROMPT = """
 You MUST defend yourself NOW. The town has voted to put you on trial.
 If you are found GUILTY, you will be EXECUTED immediately.
 Convince the town to vote INNOCENT. Your survival depends on this!
-"""
-
-_DEFENSE_RESPONSE_PROMPT = """
-🔴 YOU ARE ON TRIAL! Respond to challenges and defend yourself!
 """
 
 _CHALLENGER_PROMPT = """
@@ -696,7 +693,7 @@ You must now decide: Is {accused.name} guilty of being Mafia?"""
     verdict_event = create_chat_event(
         game_state,
         speaker="System",
-        text=f"📜 VERDICT: {accused.name} has been found {verdict.upper()}! (Guilty: {tally['guilty']}, Innocent: {tally['innocent']}, Abstain: {tally['abstain']})",
+        text=f"📜 RESULT: {accused.name} has been voted {verdict.upper()} by Town! (Guilty: {tally['guilty']}, Innocent: {tally['innocent']}, Abstain: {tally['abstain']})",
         event_type="trial_verdict",
         accused=accused.name,
         verdict=verdict,
@@ -710,18 +707,34 @@ You must now decide: Is {accused.name} guilty of being Mafia?"""
         game_state.seconds_remaining = game_state.config.phase_durations[Phase.LAST_WORDS]
         print(f"DEBUG: {accused.name} found GUILTY - proceeding to Last Words")
     else:
-        # Innocent - return to Voting phase with remaining time
-        game_state.phase = Phase.VOTING
-        remaining_time = game_state.last_phase_remaining_time or 0
-        game_state.seconds_remaining = max(remaining_time - 10, 5)
+        # Innocent - check if we've hit the max discussion phases (2)
         game_state.accused_id = None
+        game_state.voting_complete = False  # Reset so voting can happen again
         
-        innocent_event = create_system_event(
-            game_state,
-            f"✅ {accused.name} has been found INNOCENT and returns to the town. Voting continues with {game_state.seconds_remaining} seconds remaining."
-        )
-        game_state.transcript.append(innocent_event)
-        print(f"DEBUG: {accused.name} found INNOCENT - returning to Voting")
+        if game_state.discussion_count >= 2:
+            # Max discussions reached - proceed to Night
+            game_state.phase = Phase.NIGHT
+            game_state.seconds_remaining = game_state.config.phase_durations[Phase.NIGHT]
+            
+            innocent_event = create_system_event(
+                game_state,
+                f"✅ {accused.name} has been found INNOCENT and returns to the town. The day ends with no execution. Night falls..."
+            )
+            game_state.transcript.append(innocent_event)
+            print(f"DEBUG: {accused.name} found INNOCENT - max discussions reached, proceeding to Night")
+        else:
+            # Return to Discussion phase with guaranteed minimum time
+            game_state.phase = Phase.DISCUSSION
+            remaining_time = game_state.last_phase_remaining_time or 0
+            min_discussion_time = game_state.config.phase_durations[Phase.DISCUSSION] // 2  # At least half of normal discussion
+            game_state.seconds_remaining = max(remaining_time - 10, min_discussion_time, 25)  # At least 25 seconds
+            
+            innocent_event = create_system_event(
+                game_state,
+                f"✅ {accused.name} has been found INNOCENT and returns to the town. Discussion continues with {game_state.seconds_remaining} seconds remaining."
+            )
+            game_state.transcript.append(innocent_event)
+            print(f"DEBUG: {accused.name} found INNOCENT - returning to Discussion (count: {game_state.discussion_count})")
     
     return state
 
@@ -1087,8 +1100,13 @@ async def handle_detective_investigation(game_state: GameState) -> None:
     if not valid_targets:
         return
     
+    # Build context with previous investigation results
+    memory_context = ""
+    if detective.private_memory:
+        memory_context = "\n\nYour previous investigation results:\n" + "\n".join(detective.private_memory)
+    
     d_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + "\n" + get_role_prompt("Detective") + "\nYou must investigate someone. Output action with type 'investigate' and target name."},
+        {"role": "system", "content": SYSTEM_PROMPT + "\n" + get_role_prompt("Detective") + memory_context + "\nYou must investigate someone. Output action with type 'investigate' and target name."},
         {"role": "user", "content": f"Alive Players: {', '.join([p.name for p in valid_targets])}\nWho do you investigate?"}
     ]
     
@@ -1114,6 +1132,265 @@ async def handle_detective_investigation(game_state: GameState) -> None:
         )
         game_state.transcript.append(event)
         print(f"DEBUG: Detective investigated {target.name}: {result}")
+
+
+async def collect_doctor_vote(game_state: GameState) -> None:
+    """
+    Collect protection choice from the Doctor (if alive).
+    Called at the END of Night phase before mafia kills are resolved.
+    Sets game_state.doctor_protected_id with the chosen target.
+    """
+    # Find alive doctor
+    doctor = next(
+        (p for p in game_state.players if p.role == Role.DOCTOR and p.is_alive),
+        None
+    )
+    
+    if not doctor:
+        return
+    
+    # Valid targets: all alive players (including self)
+    valid_targets = [p.name for p in game_state.players if p.is_alive]
+    
+    if not valid_targets:
+        return
+    
+    # Build context using helpers
+    public_transcript = get_filtered_transcript(game_state, public_only=True, limit=20)
+    day_context = build_transcript_summary(public_transcript, limit=20)
+    
+    # Check if doctor has any useful information in memory
+    memory_hints = [m for m in doctor.private_memory if "protected" in m.lower() or "REVEALED:" in m]
+    memory_context = "\n".join(memory_hints[-5:]) if memory_hints else "(No previous information)"
+    
+    context = f"""NIGHT {game_state.day} - DOCTOR ACTION
+
+YOU ARE {doctor.name}, the Doctor.
+
+🏥 You can protect ONE player from the Mafia tonight. If the Mafia attacks them, they will survive.
+
+REMEMBERED INFORMATION:
+{memory_context}
+
+DAY EVENTS:
+{day_context if day_context else "(No events)"}
+
+VALID TARGETS: {', '.join(valid_targets)}
+Note: You may protect yourself if you think you are a target.
+
+WHO DO YOU PROTECT?"""
+    
+    vote = await call_structured_vote(
+        player_name=doctor.name,
+        context=context,
+        valid_targets=valid_targets,
+        vote_type="protect",
+        model=game_state.config.model
+    )
+    
+    print(f"DEBUG: Doctor {doctor.name} chooses to protect: {vote}")
+    
+    # Find target - default to self if invalid
+    target = next(
+        (p for p in game_state.players if p.name.lower() == vote.lower() and p.is_alive),
+        None
+    )
+    
+    if not target:
+        # Invalid target - default to self
+        target = doctor
+        event = create_chat_event(
+            game_state,
+            speaker="System",
+            text=f"🏥 {doctor.name} (Doctor) chose an invalid target. Defaulting to self-protection.",
+            private=True
+        )
+        game_state.transcript.append(event)
+        print(f"DEBUG: Doctor invalid target '{vote}', defaulting to self")
+    
+    # Set protection
+    game_state.doctor_protected_id = target.id
+    doctor.private_memory.append(f"Night {game_state.day}: Protected {target.name}")
+    
+    event = create_chat_event(
+        game_state,
+        speaker="System",
+        text=f"🏥 Doctor protects: {target.name}",
+        private=True
+    )
+    game_state.transcript.append(event)
+    print(f"DEBUG: Doctor chose to protect {target.name}")
+
+
+async def collect_vigilante_vote(game_state: GameState) -> None:
+    """
+    Collect kill vote from the Vigilante (if alive and hasn't used shot).
+    Called at the END of Night phase after mafia votes.
+    Sets game_state.vigilante_pending_kill with the chosen target.
+    """
+    # Find alive vigilante who hasn't used their shot
+    vigilante = next(
+        (p for p in game_state.players 
+         if p.role == Role.VIGILANTE and p.is_alive and not game_state.vigilante_shot_used),
+        None
+    )
+    
+    if not vigilante:
+        return
+    
+    # Valid targets: alive players (excluding self)
+    valid_targets = [p.name for p in game_state.players 
+                     if p.is_alive and p.id != vigilante.id]
+    
+    if not valid_targets:
+        return
+    
+    valid_targets.append("abstain")
+    
+    # Build context using helpers
+    public_transcript = get_filtered_transcript(game_state, public_only=True, limit=20)
+    day_context = build_transcript_summary(public_transcript, limit=20)
+    
+    # Check if vigilante has investigation results in memory
+    investigation_hints = [m for m in vigilante.private_memory if "Investigation:" in m or "REVEALED:" in m]
+    investigation_context = "\n".join(investigation_hints[-5:]) if investigation_hints else "(No investigation results)"
+    
+    context = f"""NIGHT {game_state.day} - VIGILANTE ACTION
+
+YOU ARE {vigilante.name}, the Vigilante.
+
+⚠️ WARNING: You have ONE bullet. If you kill a TOWN member, you will DIE FROM GUILT the next night!
+
+REMEMBERED INFORMATION:
+{investigation_context}
+
+DAY EVENTS:
+{day_context if day_context else "(No events)"}
+
+VALID TARGETS: {', '.join(valid_targets[:-1])}
+You may also "abstain" to save your bullet for later.
+
+WHO DO YOU SHOOT? (Choose wisely - this is irreversible!)"""
+    
+    vote = await call_structured_vote(
+        player_name=vigilante.name,
+        context=context,
+        valid_targets=valid_targets,
+        vote_type="vigilante_kill",
+        model=game_state.config.model
+    )
+    
+    print(f"DEBUG: Vigilante {vigilante.name} votes: {vote}")
+    
+    # Process the vote
+    if vote.lower() == "abstain":
+        event = create_chat_event(
+            game_state,
+            speaker="System",
+            text=f"🔫 {vigilante.name} (Vigilante) chose to abstain. Bullet saved.",
+            private=True
+        )
+        game_state.transcript.append(event)
+        print("DEBUG: Vigilante abstained")
+        return
+    
+    # Find target - check for self-target or invalid
+    target = next(
+        (p for p in game_state.players 
+         if p.name.lower() == vote.lower() and p.is_alive and p.id != vigilante.id),
+        None
+    )
+    
+    if not target:
+        # Invalid target (self or non-existent) - treat as abstain, don't consume shot
+        event = create_chat_event(
+            game_state,
+            speaker="System",
+            text=f"🔫 {vigilante.name} (Vigilante) chose an invalid target. Bullet saved.",
+            private=True
+        )
+        game_state.transcript.append(event)
+        print(f"DEBUG: Vigilante invalid target '{vote}', treating as abstain")
+        return
+    
+    # Valid target chosen - set pending kill and mark shot as used
+    game_state.vigilante_pending_kill = target.id
+    game_state.vigilante_shot_used = True
+    
+    event = create_chat_event(
+        game_state,
+        speaker="System",
+        text=f"🎯 Vigilante target: {target.name}",
+        private=True
+    )
+    game_state.transcript.append(event)
+    print(f"DEBUG: Vigilante chose to kill {target.name}")
+
+
+def process_vigilante_kill(game_state: GameState) -> Optional[Player]:
+    """
+    Process the vigilante's kill during night resolution.
+    Returns the killed player if successful, None otherwise.
+    Also sets doomed_player_id if vigilante misfired (killed town).
+    """
+    if not game_state.vigilante_pending_kill:
+        return None
+    
+    target_id = game_state.vigilante_pending_kill
+    game_state.vigilante_pending_kill = None  # Clear pending
+    
+    target = next((p for p in game_state.players if p.id == target_id), None)
+    
+    if not target or not target.is_alive:
+        return None
+    
+    # Find the vigilante (for doom check)
+    vigilante = next(
+        (p for p in game_state.players if p.role == Role.VIGILANTE and p.is_alive),
+        None
+    )
+    
+    # Kill the target
+    target.is_alive = False
+    
+    # Check if misfire (killed a town-aligned player)
+    # Town-aligned = not Mafia (Villager, Detective, Vigilante itself would be invalid)
+    if target.role != Role.MAFIA and vigilante:
+        # Misfire! Vigilante is now doomed
+        game_state.doomed_player_id = vigilante.id
+        vigilante.private_memory.append(
+            f"⚠️ DOOMED: You killed {target.name}, a {target.role.value}. You will die from guilt..."
+        )
+        print(f"DEBUG: Vigilante misfired! Killed {target.name} ({target.role.value}). Vigilante is now doomed.")
+    
+    return target
+
+
+def process_doom_death(game_state: GameState) -> Optional[Player]:
+    """
+    Process doom death at the start of night resolution.
+    A doomed vigilante dies before any other night actions.
+    Returns the doomed player if they died, None otherwise.
+    """
+    if not game_state.doomed_player_id:
+        return None
+    
+    doomed = next(
+        (p for p in game_state.players if p.id == game_state.doomed_player_id and p.is_alive),
+        None
+    )
+    
+    if not doomed:
+        game_state.doomed_player_id = None
+        return None
+    
+    # Doom death happens regardless of protection
+    doomed.is_alive = False
+    game_state.doomed_player_id = None  # Clear the doom
+    
+    print(f"DEBUG: {doomed.name} died from guilt (doom death)")
+    return doomed
+
 
 def create_game_graph():
     workflow = StateGraph(AgentState)
