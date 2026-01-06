@@ -45,8 +45,8 @@ def get_last_speaker_and_mentions(
     return last_speaker, mentioned
 
 
-def build_transcript_summary(transcript: List[Dict[str, Any]], limit: int = 10) -> str:
-    """Build a formatted transcript summary string."""
+def build_transcript_summary(transcript: List[Dict[str, Any]], limit: int = 20) -> str:
+    """Build a formatted transcript summary string."""ß
     return "\n".join([
         f"{t['payload'].get('speaker', 'System')}: {t['payload'].get('text', t['type'])}"
         for t in transcript[-limit:]
